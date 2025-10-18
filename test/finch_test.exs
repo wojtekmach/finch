@@ -763,6 +763,42 @@ defmodule FinchTest do
     end
   end
 
+  test "stream_while/7", %{bypass: bypass, finch_name: finch_name} do
+    start_supervised!({Finch, name: finch_name})
+
+    Bypass.expect_once(bypass, "POST", "/", fn conn ->
+      assert Plug.Conn.get_http_protocol(conn) == :"HTTP/1.1"
+
+      assert {:ok, "321", conn} = Plug.Conn.read_body(conn)
+
+      Plug.Conn.send_resp(conn, 200, "OK")
+    end)
+
+    req_acc = 3
+
+    req_fun = fn count ->
+      if count > 0 do
+        {:cont, "#{count}", count - 1}
+      else
+        {:cont, :counter_done}
+      end
+    end
+
+    resp_acc = {nil, [], ""}
+
+    resp_fun = fn
+      {:status, value}, {_, headers, body} -> {:cont, {value, headers, body}}
+      {:headers, value}, {status, headers, body} -> {:cont, {status, headers ++ value, body}}
+      {:data, value}, {status, headers, body} -> {:cont, {status, headers, body <> value}}
+    end
+
+    result =
+      Finch.build(:post, endpoint(bypass), [], :stream)
+      |> Finch.stream_while(finch_name, req_acc, req_fun, resp_acc, resp_fun)
+
+    assert {:ok, :counter_done, {200, [_ | _], "OK"}} = result
+  end
+
   describe "stream_while/5" do
     test "successful get request with HTTP/1", %{bypass: bypass, finch_name: finch_name} do
       start_supervised!({Finch, name: finch_name})

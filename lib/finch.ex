@@ -446,6 +446,14 @@ defmodule Finch do
     end
   end
 
+  def stream_while(%Request{} = req, name, req_acc, req_fun, resp_acc, resp_fun, opts \\ [])
+      when is_function(req_fun, 1) and is_function(resp_fun, 2) do
+    request_span req, name do
+      {pool, pool_mod} = get_pool(req, name)
+      pool_mod.request(pool, req, req_acc, req_fun, resp_acc, resp_fun, name, opts)
+    end
+  end
+
   defp __stream__(%Request{} = req, name, acc, fun, opts) do
     {pool, pool_mod} = get_pool(req, name)
     pool_mod.request(pool, req, acc, fun, name, opts)

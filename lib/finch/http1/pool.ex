@@ -106,6 +106,73 @@ defmodule Finch.HTTP1.Pool do
     end
   end
 
+  def request(pool, req, req_acc, req_fun, resp_acc, resp_fun, name, opts) do
+    pool_timeout = Keyword.get(opts, :pool_timeout, 5_000)
+    receive_timeout = Keyword.get(opts, :receive_timeout, 15_000)
+    request_timeout = Keyword.get(opts, :request_timeout, :infinity)
+
+    metadata = %{request: req, pool: pool, name: name}
+
+    start_time = Telemetry.start(:queue, metadata)
+
+    try do
+      NimblePool.checkout!(
+        pool,
+        :checkout,
+        fn from, {state, conn, idle_time} ->
+          Telemetry.stop(:queue, start_time, metadata, %{idle_time: idle_time})
+
+          case Conn.connect(conn, name) do
+            {:ok, conn} ->
+              Conn.request(
+                conn,
+                req,
+                req_acc,
+                req_fun,
+                resp_acc,
+                resp_fun,
+                name,
+                receive_timeout,
+                request_timeout,
+                idle_time
+              )
+              |> case do
+                {:ok, conn, req_acc, resp_acc} ->
+                  {{:ok, req_acc, resp_acc}, transfer_if_open(conn, state, from)}
+
+                {:error, conn, error, req_acc, resp_acc} ->
+                  {{:error, error, req_acc, resp_acc}, transfer_if_open(conn, state, from)}
+              end
+
+            {:error, conn, error} ->
+              {{:error, error, req_acc, resp_acc}, transfer_if_open(conn, state, from)}
+          end
+        end,
+        pool_timeout
+      )
+    catch
+      :exit, data ->
+        Telemetry.exception(:queue, start_time, :exit, data, __STACKTRACE__, metadata)
+
+        # Provide helpful error messages for known errors
+        case data do
+          {:timeout, {NimblePool, :checkout, _affected_pids}} ->
+            reraise(
+              """
+              Finch was unable to provide a connection within the timeout due to excess queuing \
+              for connections. Consider adjusting the pool size, count, timeout or reducing the \
+              rate of requests if it is possible that the downstream service is unable to keep up \
+              with the current rate.
+              """,
+              __STACKTRACE__
+            )
+
+          _ ->
+            exit(data)
+        end
+    end
+  end
+
   @impl Finch.Pool
   def async_request(pool, req, name, opts) do
     owner = self()

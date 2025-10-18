@@ -164,6 +164,117 @@ defmodule Finch.HTTP1.Conn do
     end
   end
 
+  def request(%{mint: nil} = conn, _, _, _, _, _, _, _, _, _),
+    do: {:error, conn, "Could not connect"}
+
+  def request(
+        conn,
+        req,
+        req_acc,
+        req_fun,
+        resp_acc,
+        resp_fun,
+        name,
+        receive_timeout,
+        request_timeout,
+        idle_time
+      ) do
+    full_path = Finch.Request.request_path(req)
+
+    metadata = %{request: req, name: name}
+
+    extra_measurements = %{idle_time: idle_time}
+
+    start_time = Telemetry.start(:send, metadata, extra_measurements)
+
+    try do
+      case Mint.HTTP.request(
+             conn.mint,
+             req.method,
+             full_path,
+             req.headers,
+             :stream
+           ) do
+        {:ok, mint, ref} ->
+          case stream_req(mint, ref, req_acc, req_fun) do
+            # TODO: handle :halt
+            {:cont, mint, req_acc} ->
+              Telemetry.stop(:send, start_time, metadata, extra_measurements)
+              start_time = Telemetry.start(:recv, metadata, extra_measurements)
+              resp_metadata = %{status: nil, headers: [], trailers: []}
+              timeouts = %{receive_timeout: receive_timeout, request_timeout: request_timeout}
+
+              response =
+                receive_response(
+                  [],
+                  resp_acc,
+                  resp_fun,
+                  mint,
+                  ref,
+                  timeouts,
+                  :headers,
+                  resp_metadata
+                )
+
+              handle_response(
+                response,
+                req_acc,
+                conn,
+                metadata,
+                start_time,
+                extra_measurements
+              )
+
+            {:error, mint, error} ->
+              raise "foo"
+
+              handle_request_error(
+                conn,
+                mint,
+                error,
+                resp_acc,
+                metadata,
+                start_time,
+                extra_measurements
+              )
+          end
+
+        {:error, mint, error} ->
+          raise "foo"
+
+          handle_request_error(
+            conn,
+            mint,
+            error,
+            req_acc,
+            metadata,
+            start_time,
+            extra_measurements
+          )
+      end
+    catch
+      kind, error ->
+        close(conn)
+        Telemetry.exception(:recv, start_time, kind, error, __STACKTRACE__, metadata)
+        :erlang.raise(kind, error, __STACKTRACE__)
+    end
+  end
+
+  defp stream_req(mint, ref, req_acc, req_fun) do
+    case req_fun.(req_acc) do
+      {:cont, chunk, req_acc} ->
+        # TODO: handle error
+        {:ok, mint} = Mint.HTTP.stream_request_body(mint, ref, chunk)
+        stream_req(mint, ref, req_acc, req_fun)
+
+      {:cont, req_acc} ->
+        {:ok, mint} = Mint.HTTP.stream_request_body(mint, ref, :eof)
+        {:cont, mint, req_acc}
+
+        # TODO: handle :halt
+    end
+  end
+
   defp stream_or_body({:stream, _}), do: :stream
   defp stream_or_body(body), do: body
 
@@ -206,6 +317,20 @@ defmodule Finch.HTTP1.Conn do
         metadata = Map.merge(metadata, Map.put(resp_metadata, :error, error))
         Telemetry.stop(:recv, start_time, metadata, extra_measurements)
         {:error, %{conn | mint: mint}, error, acc}
+    end
+  end
+
+  defp handle_response(response, req_acc, conn, metadata, start_time, extra_measurements) do
+    case response do
+      {:ok, mint, acc, resp_metadata} ->
+        metadata = Map.merge(metadata, resp_metadata)
+        Telemetry.stop(:recv, start_time, metadata, extra_measurements)
+        {:ok, %{conn | mint: mint}, req_acc, acc}
+
+      {:error, mint, error, acc, resp_metadata} ->
+        metadata = Map.merge(metadata, Map.put(resp_metadata, :error, error))
+        Telemetry.stop(:recv, start_time, metadata, extra_measurements)
+        {:error, %{conn | mint: mint}, error, req_acc, acc}
     end
   end
 
